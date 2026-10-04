@@ -1,13 +1,48 @@
 from typing import Any
 from uuid import uuid4
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from math import radians, sin, cos, sqrt, atan2
+from accounts import get_station_scope, route_unassigned
 from firebase import get_db
 
 router = APIRouter(prefix="/dashboard", tags=["Dashboard"])
+
+def _created_datetime(data: dict[str, Any]) -> datetime | None:
+    return _to_dt(data.get("timestamp") or data.get("createdAt"))
+
+
+# A report is live until it has ended or a day has passed; after that it
+# belongs in History. (report.py, dashboard.py and history.py share this rule.)
+ARCHIVE_AFTER = timedelta(hours=24)
+ENDED_STATUSES = frozenset({"resolved", "closed", "completed", "cancelled", "ended"})
+
+
+def _has_ended(data: dict[str, Any]) -> bool:
+    return str(data.get("status") or "").strip().lower() in ENDED_STATUSES
+
+
+def _is_archived(data: dict[str, Any]) -> bool:
+    if _has_ended(data):
+        return True
+    created = _created_datetime(data)
+    return created is not None and datetime.now(timezone.utc) - created >= ARCHIVE_AFTER
+
+
+def _report_station_id(data: dict[str, Any]) -> str:
+    """The station a report was routed to (same precedence the payloads use)."""
+    assigned = data.get("assignedStation") or {}
+    return str(data.get("nearestStationId") or assigned.get("stationId") or "").strip()
+
+
+def _matches_station(data: dict[str, Any], station_id: str | None) -> bool:
+    """True if the report belongs to station_id. No station_id = no filtering."""
+    if not station_id or not station_id.strip():
+        return True
+    return _report_station_id(data) == station_id.strip()
+
 
 
 class AccountCreate(BaseModel):
@@ -168,13 +203,17 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any) -> dict[st
         "status": data.get("status", "pending"),
         "nearestStationId": data.get("nearestStationId") or assigned_station.get("stationId", ""),
         "streamChannelId": data.get("streamChannelId") or data.get("channelName", ""),
+        # Stamped server-side by report.py's PATCH /reports/{id} the moment
+        # status crosses into ENDED_STATUSES — surfaced here too since this
+        # payload shape mirrors report.py's.
+        "endedAt": _to_dt(data.get("endedAt")).isoformat() if _to_dt(data.get("endedAt")) else None,
     }
 
 
 # ── Stats ─────────────────────────────────────────────────────────────────────
 
 @router.get("/stats")
-def get_stats():
+def get_stats(station_id: str | None = Depends(get_station_scope)):
     """
     Returns all 4 dashboard stat cards:
       todayReports, unitsAvailable, unitsDeployed, reportedAreas, recentReports
@@ -182,14 +221,16 @@ def get_stats():
     db = get_db()
     today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
 
-    call_docs = list(db.collection("ActiveCalls").stream())
+    call_docs = route_unassigned(db, list(db.collection("ActiveCalls").stream()))
 
     today_reports = 0
     reported_station_ids = set()
     recent_reports = []
 
     for doc in call_docs:
-        data = doc.to_dict()
+        data = doc.to_dict() or {}
+        if not _matches_station(data, station_id):
+            continue
         created_dt = _to_dt(data.get("timestamp") or data.get("createdAt"))
 
         if created_dt and created_dt >= today_start:
@@ -197,8 +238,12 @@ def get_stats():
 
         assigned_station = data.get("assignedStation") or {}
         sid = (data.get("nearestStationId") or assigned_station.get("stationId", "")).strip()
-        if sid and data.get("status") not in ("resolved", "closed", "completed", "cancelled"):
+        if sid and not _is_archived(data):
             reported_station_ids.add(sid)
+
+        # Ended or day-old reports live in History now, not the dashboard feed.
+        if _is_archived(data):
+            continue
 
         recent_reports.append({
             "id": doc.id,
@@ -206,12 +251,15 @@ def get_stats():
             "nearestStationId": data.get("nearestStationId") or assigned_station.get("stationId", ""),
             "status": data.get("status", "pending"),
             "createdAt": created_dt.isoformat() if created_dt else None,
+            "endedAt": _to_dt(data.get("endedAt")).isoformat() if _to_dt(data.get("endedAt")) else None,
         })
 
     recent_reports.sort(key=lambda r: r["createdAt"] or "", reverse=True)
     recent_reports = recent_reports[:10]
 
     responder_docs = list(db.collection("Responders").stream())
+    if station_id:
+        responder_docs = [d for d in responder_docs if (d.to_dict() or {}).get("stationId") == station_id]
     units_available = sum(1 for d in responder_docs if d.to_dict().get("status") == "available")
     units_deployed  = sum(1 for d in responder_docs if d.to_dict().get("status") == "deployed")
 
@@ -227,7 +275,7 @@ def get_stats():
 # ── Active Emergencies ────────────────────────────────────────────────────────
 
 @router.get("/active")
-def get_active():
+def get_active(station_id: str | None = Depends(get_station_scope)):
     """Left panel — active calls. Called directly by the frontend's
     getActiveEmergencies(), which is what report.js polls to find the next
     incident to open. Note: since the ActiveCalls collection only ever
@@ -236,12 +284,12 @@ def get_active():
     (ActiveCalls documents use their own status values, e.g. "evaluating").
     We just exclude anything explicitly marked as finished."""
     db = get_db()
-    docs = list(db.collection("ActiveCalls").stream())
+    docs = route_unassigned(db, list(db.collection("ActiveCalls").stream()))
 
     active = []
     for doc in docs:
-        data = doc.to_dict()
-        if data.get("status") in ("resolved", "closed", "completed", "cancelled"):
+        data = doc.to_dict() or {}
+        if _is_archived(data) or not _matches_station(data, station_id):
             continue
         assigned_station = data.get("assignedStation") or {}
         created_dt = _to_dt(data.get("timestamp") or data.get("createdAt"))
@@ -254,6 +302,10 @@ def get_active():
             "status": data.get("status", "pending"),
             "streamChannelId": data.get("streamChannelId") or data.get("channelName", ""),
             "createdAt": created_dt,
+            # Always None here in practice — _is_archived() already filters out
+            # anything with an ended status before it reaches this list — but
+            # kept for shape parity with the other report payloads.
+            "endedAt": _to_dt(data.get("endedAt")).isoformat() if _to_dt(data.get("endedAt")) else None,
         })
 
     # Previously this returned whatever order Firestore happened to stream
@@ -270,19 +322,22 @@ def get_active():
 # ── Recent Reports ────────────────────────────────────────────────────────────
 
 @router.get("/recent")
-def get_recent(limit: int = 10):
+def get_recent(limit: int = 10, station_id: str | None = Depends(get_station_scope)):
     """Right panel — most recent reports sorted by createdAt."""
     db = get_db()
-    docs = list(
+    # No .limit() on the query: ended / day-old reports are skipped below, so
+    # the limit has to be applied after filtering or the feed would come up short.
+    docs = route_unassigned(db, list(
         db.collection("ActiveCalls")
         .order_by("timestamp", direction="DESCENDING")
-        .limit(limit)
         .stream()
-    )
+    ))
 
     reports = []
     for doc in docs:
-        data = doc.to_dict()
+        data = doc.to_dict() or {}
+        if _is_archived(data) or not _matches_station(data, station_id):
+            continue
         created_dt = _to_dt(data.get("timestamp") or data.get("createdAt"))
         assigned_station = data.get("assignedStation") or {}
         reports.append({
@@ -291,7 +346,12 @@ def get_recent(limit: int = 10):
             "nearestStationId": data.get("nearestStationId") or assigned_station.get("stationId", ""),
             "status": data.get("status", "pending"),
             "createdAt": created_dt.isoformat() if created_dt else None,
+            # Same parity note as get_active(): filtered to non-archived docs,
+            # so this is always None today, but kept for a consistent shape.
+            "endedAt": _to_dt(data.get("endedAt")).isoformat() if _to_dt(data.get("endedAt")) else None,
         })
+        if len(reports) >= limit:
+            break
 
     return {"reports": reports}
 
@@ -404,7 +464,7 @@ def get_stations_for_emergency(emergency_id: str):
 
     for s in station_docs:
         sd = s.to_dict()
-        loc = sd.get("location")
+        loc = sd.get("Location") if sd.get("Location") is not None else sd.get("location")
 
         s_lat, s_lng = None, None
         if loc:

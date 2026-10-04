@@ -1,4 +1,6 @@
 from datetime import datetime, timezone
+from math import atan2, cos, radians, sin, sqrt
+from typing import Any
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException
@@ -9,11 +11,23 @@ from firebase import get_db
 router = APIRouter(prefix="/accounts", tags=["Accounts"])
 
 # ---------------------------------------------------------------------------
-# Page permissions
+# Roles & page permissions
 #
-# Rule: only true Super Admins (see FULL_ACCESS_ROLES below) get every page.
-# Everyone else — Responders and any account made through the Accounts page
-# regardless of role — gets exactly dashboard, report, history, units.
+# Three roles now, all living in the single Responders collection (see
+# "Collection routing" below):
+#
+#   super_admin      -> every page, no restrictions. Created ONLY via
+#                        auth.py's /auth/signup "Create Admin Account" flow.
+#   responder_admin   -> exactly dashboard, report, history, units. No
+#                        Stations, no Accounts. Created ONLY via this file's
+#                        create_account() (the Accounts page). Shown in that
+#                        page's role dropdown as "Admin" — the stored value
+#                        is still "responder_admin"; only the label changed.
+#   responder         -> mobile app only. Not a web-login role at all: gets
+#                        ZERO pages here, not just the restricted set. This
+#                        project doesn't gate at /auth/login itself (that
+#                        endpoint is shared with the mobile app), so the
+#                        block happens here, at the page-permission layer.
 #
 # Identity: this project doesn't verify a signed token on every request, so
 # the caller is identified the same way the rest of this file already treats
@@ -23,31 +37,27 @@ router = APIRouter(prefix="/accounts", tags=["Accounts"])
 # anyone who can set a request header can claim to be any account id. Put a
 # real auth check (signed token / session cookie) in front of this once one
 # exists.
-# ---------------------------------------------------------------------------
-
-# A role missing from this dict has full access (see get_allowed_pages).
-# ---------------------------------------------------------------------------
-# Rule: the ONLY unrestricted accounts are true Super Admins — ones created
-# through the login page's "Create Admin Account" form (auth.js's
-# handleRegisterRequest, which tags the resulting doc role: "super_admin"
-# right after signup — see that file).
 #
-# Everything else gets the same four pages, no matter what role string was
-# typed into the Accounts page's role dropdown when the account was made
-# there (Responder, Admin, Dispatcher, whatever) — an account created
-# through accounts.py/accounts.html is never a Super Admin, full stop.
-# That's a default-DENY: a missing/blank role is restricted too, not
-# unrestricted.
+# Default-DENY: a missing/blank role falls back to "Responder" (see
+# get_current_account / _serialize), which is mobile-only, i.e. zero pages —
+# not unrestricted and not even the four-page restricted set.
 # ---------------------------------------------------------------------------
 FULL_ACCESS_ROLES = {"super_admin"}
+MOBILE_ONLY_ROLES = {"responder"}
 RESTRICTED_PAGES = {"dashboard", "report", "history", "units"}
 
 
 def get_allowed_pages(role: str) -> set[str] | None:
-    """None means unrestricted (super_admin only); otherwise the fixed allow-list."""
+    """
+    None means unrestricted (super_admin only); an empty set means no web
+    pages at all (plain field responders — mobile app only); otherwise the
+    fixed four-page allow-list (responder_admin).
+    """
     normalized = (role or "").strip().lower()
     if normalized in FULL_ACCESS_ROLES:
         return None
+    if normalized in MOBILE_ONLY_ROLES:
+        return set()
     return RESTRICTED_PAGES
 
 
@@ -63,18 +73,149 @@ def get_current_account(x_account_id: str = Header(None, alias="X-Account-Id")) 
         raise HTTPException(status_code=401, detail="Missing X-Account-Id header")
 
     db = get_db()
-    for collection in (RESPONDERS, USERS):
-        snapshot = db.collection(collection).document(x_account_id).get()
-        if snapshot.exists:
-            data = snapshot.to_dict() or {}
-            return {
-                "id": x_account_id,
-                "collection": collection,
-                "role": data.get("role") or data.get("position") or "Responder",
-                "status": data.get("status"),
-            }
+    snapshot = db.collection(RESPONDERS).document(x_account_id).get()
+    if not snapshot.exists:
+        raise HTTPException(status_code=404, detail="Account not found")
 
-    raise HTTPException(status_code=404, detail="Account not found")
+    data = snapshot.to_dict() or {}
+    return {
+        "id": x_account_id,
+        "collection": RESPONDERS,
+        "role": data.get("role") or data.get("position") or "Responder",
+        "status": data.get("status"),
+        "stationId": str(data.get("stationId") or "").strip(),
+    }
+
+
+# Returned by get_station_scope for a station-bound admin whose account has no
+# stationId set. It matches no report, so they see nothing (fail closed)
+# instead of everything.
+NO_STATION_SCOPE = "__no_station_assigned__"
+
+
+def get_station_scope(account: dict = Depends(get_current_account)) -> str | None:
+    """
+    Which station's data the caller may see, resolved server-side from the
+    X-Account-Id header (never from a client-supplied query param).
+
+      None            -> super_admin: unrestricted, sees every station.
+      "ST002"         -> anyone else: only reports/units routed to that station.
+      NO_STATION_SCOPE -> station-bound account with no stationId: sees nothing.
+    """
+    if (account["role"] or "").strip().lower() in FULL_ACCESS_ROLES:
+        return None
+    return account.get("stationId") or NO_STATION_SCOPE
+
+
+# ---------------------------------------------------------------------------
+# Nearest-station auto-routing for ActiveCalls
+#
+# Nothing else in the backend sets `nearestStationId` when a report is created
+# (only the manual PATCH in dashboard.py does), so a station-scoped admin would
+# never see a brand-new report. route_unassigned() fills that gap: any call
+# with no station yet is routed to the closest station that has coordinates and
+# the result is saved to Firestore (nearestStationId + assignedStation).
+# Lives here because report.py, dashboard.py, history.py and stream.py already
+# import from this module.
+# ---------------------------------------------------------------------------
+
+def _haversine_km(lat1, lng1, lat2, lng2) -> float:
+    r = 6371.0
+    dlat, dlng = radians(lat2 - lat1), radians(lng2 - lng1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlng / 2) ** 2
+    return r * 2 * atan2(sqrt(a), sqrt(1 - a))
+
+
+def _pair(lat: Any, lng: Any) -> tuple[float, float] | None:
+    try:
+        if lat is None or lng is None:
+            return None
+        return float(lat), float(lng)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coords(loc: Any) -> tuple[float, float] | None:
+    """GeoPoint, or a dict with latitude/longitude or lat/lng."""
+    if loc is None:
+        return None
+    if hasattr(loc, "latitude") and hasattr(loc, "longitude"):
+        return _pair(loc.latitude, loc.longitude)
+    if isinstance(loc, dict):
+        return _pair(loc.get("latitude", loc.get("lat")), loc.get("longitude", loc.get("lng")))
+    return None
+
+
+def call_coords(data: dict[str, Any]) -> tuple[float, float] | None:
+    return _coords(data.get("location")) or _pair(
+        data.get("latitude", data.get("lat")), data.get("longitude", data.get("lng"))
+    )
+
+
+def station_coords(sd: dict[str, Any]) -> tuple[float, float] | None:
+    # Firestore field names are case-sensitive and Stations uses "Location".
+    loc = sd.get("Location")
+    return _coords(loc if loc is not None else sd.get("location"))
+
+
+def has_station(data: dict[str, Any]) -> bool:
+    assigned = data.get("assignedStation") or {}
+    return bool(str(data.get("nearestStationId") or assigned.get("stationId") or "").strip())
+
+
+class _RoutedDoc:
+    """Stand-in for a Firestore snapshot carrying the freshly-routed data."""
+
+    def __init__(self, doc_id: str, data: dict[str, Any]):
+        self.id = doc_id
+        self._data = data
+        self.exists = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(self._data)
+
+
+def route_unassigned(db: Any, docs: list) -> list:
+    """Return docs, with any station-less ones routed to their nearest station
+    (saved to Firestore). Docs that can't be routed (no coordinates, no station
+    with coordinates) come back unchanged."""
+    stations: list[tuple[str, dict[str, Any], tuple[float, float]]] | None = None
+    out = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        if has_station(data):
+            out.append(doc)
+            continue
+        point = call_coords(data)
+        if point is None:
+            out.append(doc)
+            continue
+        if stations is None:
+            stations = []
+            for s in db.collection("Stations").stream():
+                sd = s.to_dict() or {}
+                sc = station_coords(sd)
+                if sc is not None:
+                    stations.append((s.id, sd, sc))
+        if not stations:
+            out.append(doc)
+            continue
+        sid, sd, _ = min(stations, key=lambda s: _haversine_km(point[0], point[1], s[2][0], s[2][1]))
+        assigned = dict(data.get("assignedStation") or {})
+        assigned.update({
+            "stationId": sid,
+            "stationName": sd.get("stationName", ""),
+            "commanderName": sd.get("commanderName") or sd.get("chiefName", ""),
+        })
+        try:
+            db.collection("ActiveCalls").document(doc.id).update(
+                {"nearestStationId": sid, "assignedStation": assigned}
+            )
+        except Exception:
+            out.append(doc)
+            continue
+        out.append(_RoutedDoc(doc.id, {**data, "nearestStationId": sid, "assignedStation": assigned}))
+    return out
 
 
 def require_page(page: str):
@@ -104,24 +245,21 @@ def require_page(page: str):
 
 
 # ---------------------------------------------------------------------------
-# Collection routing
+# Collection
 #
-#   role == "Responder"  -> Responders collection ONLY
-#   any other role       -> Users collection ONLY
-#
-# Responders is the operational roster (people who work shifts and can be
-# dispatched). Users is everyone else — admins, dispatchers, station chiefs.
-# An account lives in exactly one of the two, never both, so there is a single
-# source of truth per account and no pair of docs to drift apart.
+# Every account — super_admin, responder_admin, and plain responder — lives
+# in this single collection. There is no more separate Users collection;
+# routing between two collections by role is gone, so an account is always
+# found (and always written) in exactly one place.
 #
 # Two independent fields, do not conflate them:
 #   status -> "on" / "off" / "inactive": account status, as before.
 #   duty   -> "on_duty" / "off_duty": is this responder CURRENTLY on shift?
-#             Only meaningful for responders.
+#             Only meaningful for plain field responders (see _has_duty) —
+#             super_admin and responder_admin accounts don't track a shift.
 # ---------------------------------------------------------------------------
 
 RESPONDERS = "Responders"
-USERS = "Users"
 
 # Same default auth.py already applies when signup() is called with no
 # password (see the comment in accounts.js about DEFAULT_RESPONDER_PASSWORD).
@@ -166,13 +304,13 @@ class DutyUpdate(BaseModel):
     duty: str | None = None  # omit to flip whatever is currently stored
 
 
-def _is_responder(role: str) -> bool:
-    """A blank role defaults to Responder, matching the list endpoint's fallback."""
+def _has_duty(role: str) -> bool:
+    """
+    Only plain field responders track a duty/shift state — super_admin and
+    responder_admin accounts don't go on/off shift. A blank role defaults to
+    Responder, matching the list endpoint's fallback.
+    """
     return (role or "Responder").strip().lower() == "responder"
-
-
-def _collection_for_role(role: str) -> str:
-    return RESPONDERS if _is_responder(role) else USERS
 
 
 def _normalize_status(raw_status: str) -> str:
@@ -209,45 +347,41 @@ def _normalize_duty(raw_duty) -> str:
     return "off_duty"
 
 
-def _serialize(doc_id: str, data: dict, collection: str) -> dict:
-    """Shared response shape, used for docs from either collection."""
-    is_responder = collection == RESPONDERS
+def _serialize(doc_id: str, data: dict) -> dict:
+    """Shared response shape for a Responders-collection doc."""
+    role = data.get("role") or data.get("position") or "Responder"
+    has_duty = _has_duty(role)
 
     account = {
         "id": doc_id,
-        "collection": collection,
+        "collection": RESPONDERS,
         "firstName": data.get("firstName", ""),
         "lastName": data.get("lastName", ""),
         "name": f"{data.get('firstName', '')} {data.get('lastName', '')}".strip() or data.get("name") or "Unknown",
         "badge": data.get("badge", ""),
         "email": data.get("email", ""),
-        "role": data.get("role") or data.get("position") or "Responder",
+        "role": role,
         "stationId": data.get("stationId", ""),
         "unitId": data.get("unitId") or "",
         "status": _normalize_status(data.get("status")),
         "is_new": data.get("is_new", False),
     }
 
-    # duty is a responder-only concept; non-responders report null so the UI
-    # can render a dash instead of a misleading "Off duty" badge.
-    account["duty"] = _normalize_duty(data.get("duty")) if is_responder else None
-    account["dutyChangedAt"] = data.get("dutyChangedAt") if is_responder else None
+    # duty is a plain-responder-only concept; super_admin/responder_admin
+    # report null so the UI can render a dash instead of a misleading
+    # "Off duty" badge.
+    account["duty"] = _normalize_duty(data.get("duty")) if has_duty else None
+    account["dutyChangedAt"] = data.get("dutyChangedAt") if has_duty else None
 
     return account
 
 
 def _find_account(db, account_id: str):
-    """
-    Locates an account in whichever collection holds it.
-
-    Returns (doc_ref, snapshot, collection_name). Responders is checked first
-    since it is the hot path for duty toggles.
-    """
-    for collection in (RESPONDERS, USERS):
-        ref = db.collection(collection).document(account_id)
-        snapshot = ref.get()
-        if snapshot.exists:
-            return ref, snapshot, collection
+    """Returns (doc_ref, snapshot) or raises 404."""
+    ref = db.collection(RESPONDERS).document(account_id)
+    snapshot = ref.get()
+    if snapshot.exists:
+        return ref, snapshot
     raise HTTPException(status_code=404, detail="Account not found")
 
 
@@ -258,17 +392,18 @@ def get_me(account: dict = Depends(get_current_account)):
     header. Frontend calls this right after login to know who it's talking to.
     """
     db = get_db()
-    ref = db.collection(account["collection"]).document(account["id"])
+    ref = db.collection(RESPONDERS).document(account["id"])
     data = ref.get().to_dict() or {}
-    return _serialize(account["id"], data, account["collection"])
+    return _serialize(account["id"], data)
 
 
 @router.get("/me/permissions")
 def get_my_permissions(account: dict = Depends(get_current_account)):
     """
     Which pages the logged-in caller may see. `pages: null` means
-    unrestricted (any page); otherwise it's the exact allow-list — e.g.
-    Responders get exactly ["dashboard", "report", "history", "units"].
+    unrestricted (super_admin); `pages: []` means no web pages at all (plain
+    field responders — mobile only); otherwise the exact allow-list, e.g.
+    responder_admin gets exactly ["dashboard", "report", "history", "units"].
 
     Frontend calls this after login and hides any nav item not in the list.
     The backend still enforces this on each route via require_page(), so
@@ -284,13 +419,14 @@ def get_my_permissions(account: dict = Depends(get_current_account)):
 @router.get("")
 def list_accounts(duty: str | None = None, status: str | None = None, role: str | None = None):
     """
-    Frontend accounts page: the full roster, merged from both collections.
+    Frontend accounts page: the full roster (super_admin, responder_admin,
+    and plain responders all live in the one Responders collection now).
 
     Optional filters, normalized the same way as the stored values so
     ?duty=on and ?duty=on_duty behave identically:
-      /accounts?duty=on_duty      -> responders currently on shift
-      /accounts?status=on         -> only accounts with status "on"
-      /accounts?role=Responder    -> Responders collection only
+      /accounts?duty=on_duty         -> responders currently on shift
+      /accounts?status=on            -> only accounts with status "on"
+      /accounts?role=responder_admin -> only Admin accounts
     """
     db = get_db()
 
@@ -299,46 +435,55 @@ def list_accounts(duty: str | None = None, status: str | None = None, role: str 
     role_filter = role.strip().lower() if role else None
 
     accounts = []
-    seen: set[str] = set()
+    for doc in db.collection(RESPONDERS).stream():
+        account = _serialize(doc.id, doc.to_dict() or {})
 
-    for collection in (RESPONDERS, USERS):
-        for doc in db.collection(collection).stream():
-            # A doc id could exist in both collections if an older build wrote
-            # to both, or mid-migration. Responders is streamed first and wins.
-            if doc.id in seen:
-                continue
-            seen.add(doc.id)
+        if role_filter and account["role"].strip().lower() != role_filter:
+            continue
+        if status_filter and account["status"] != status_filter:
+            continue
+        # A duty filter only ever matches plain responders, since duty is
+        # None for super_admin/responder_admin.
+        if duty_filter and account["duty"] != duty_filter:
+            continue
 
-            account = _serialize(doc.id, doc.to_dict() or {}, collection)
+        accounts.append(account)
 
-            if role_filter and account["role"].strip().lower() != role_filter:
-                continue
-            if status_filter and account["status"] != status_filter:
-                continue
-            # A duty filter only ever matches responders, since duty is None
-            # for everyone else.
-            if duty_filter and account["duty"] != duty_filter:
-                continue
-
-            accounts.append(account)
-
-    responders = [a for a in accounts if a["collection"] == RESPONDERS]
-    on_duty = [a for a in responders if a["duty"] == "on_duty"]
+    field_responders = [a for a in accounts if a["duty"] is not None]
+    on_duty = [a for a in field_responders if a["duty"] == "on_duty"]
+    responder_admins = [a for a in accounts if a["role"].strip().lower() == "responder_admin"]
+    super_admins = [a for a in accounts if a["role"].strip().lower() == "super_admin"]
 
     return {
         "accounts": accounts,
         "counts": {
             "total": len(accounts),
-            "responders": len(responders),
-            "users": len(accounts) - len(responders),
+            "responders": len(field_responders),
+            "responderAdmins": len(responder_admins),
+            "superAdmins": len(super_admins),
             "onDuty": len(on_duty),
-            "offDuty": len(responders) - len(on_duty),
+            "offDuty": len(field_responders) - len(on_duty),
         },
     }
 
 
 @router.post("", status_code=201)
 def create_account(payload: AccountCreate):
+    """
+    Creates a plain responder or a responder_admin ("Admin" in the Accounts
+    page dropdown; the stored role string is still "responder_admin").
+
+    Super Admins are NOT created here — that only happens via auth.py's
+    /auth/signup "Create Admin Account" flow, which writes straight into
+    Responders with role="super_admin".
+    """
+    requested_role = (payload.role or "Responder").strip()
+    if requested_role.lower() == "super_admin":
+        raise HTTPException(
+            status_code=409,
+            detail="Super Admin accounts can only be created via /auth/signup.",
+        )
+
     db = get_db()
     # If this account was created via /auth/signup first (the normal flow from
     # the Accounts page — see accounts.js), payload.id is that Firebase Auth
@@ -348,51 +493,48 @@ def create_account(payload: AccountCreate):
     # second, disconnected record that isn't tied to any login credential.
     account_id = payload.id or str(uuid4())
 
-    collection = _collection_for_role(payload.role)
-    is_responder = collection == RESPONDERS
+    has_duty = _has_duty(requested_role)
 
     account_data = {
         "firstName": payload.firstName,
         "lastName": payload.lastName,
         "badge": payload.badge,
         "email": payload.email,
-        "role": payload.role or "Responder",
+        "role": requested_role,
         "stationId": payload.stationId,
         "status": _normalize_status(payload.status),
         "unitId": payload.unitId,
         "is_new": payload.is_new,
     }
 
-    if is_responder:
+    if has_duty:
         account_data["duty"] = _normalize_duty(payload.duty)
         account_data["dutyChangedAt"] = datetime.now(timezone.utc)
 
     # merge=True (not a plain .set()) so this doesn't wipe out the "username"
     # field that /auth/signup already wrote for this same doc — login-by-
     # username depends on that field still being present.
-    db.collection(collection).document(account_id).set({
+    db.collection(RESPONDERS).document(account_id).set({
         **account_data,
         "createdAt": datetime.now(timezone.utc),
     }, merge=True)
 
-    # signup() writes before it knows the role, so the other collection may be
-    # left holding a stray half-populated doc. Clear it, so the
-    # one-account-one-collection rule actually holds.
-    other = USERS if is_responder else RESPONDERS
-    other_ref = db.collection(other).document(account_id)
-    if other_ref.get().exists:
-        other_ref.delete()
-
-    return {"id": account_id, "collection": collection, **account_data}
+    return {"id": account_id, "collection": RESPONDERS, **account_data}
 
 
 @router.patch("/{account_id}")
 def update_account(account_id: str, payload: AccountUpdate):
     db = get_db()
-    ref, snapshot, collection = _find_account(db, account_id)
+    ref, snapshot = _find_account(db, account_id)
     existing = snapshot.to_dict() or {}
 
     data = payload.model_dump(exclude_unset=True)
+
+    if "role" in data and (data["role"] or "").strip().lower() == "super_admin":
+        raise HTTPException(
+            status_code=409,
+            detail="Super Admin role can only be granted via /auth/signup.",
+        )
 
     # Normalize before writing so an admin UI sending "On Duty" or a mobile
     # client sending "on" can't put an unrecognized string into Firestore.
@@ -403,37 +545,19 @@ def update_account(account_id: str, payload: AccountUpdate):
         data["dutyChangedAt"] = datetime.now(timezone.utc)
 
     if not data:
-        return {"updated": True, "accountId": account_id, "collection": collection}
+        return {"updated": True, "accountId": account_id, "collection": RESPONDERS}
 
-    # Changing the role can move the account between collections. Copy the
-    # full merged doc across, then drop the original, so nothing is lost and
-    # the account never exists in two places at once.
-    target = _collection_for_role(data["role"]) if "role" in data else collection
-
-    if target != collection:
-        merged = {**existing, **data}
-        if target == RESPONDERS:
-            merged.setdefault("duty", "off_duty")
-            merged.setdefault("dutyChangedAt", datetime.now(timezone.utc))
+    # A role change can move an account into or out of duty-tracking, since
+    # only plain field responders have a shift state. Keep the duty fields
+    # consistent rather than leaving stale/missing ones behind.
+    if "role" in data:
+        if _has_duty(data["role"]):
+            data.setdefault("duty", existing.get("duty", "off_duty"))
+            data.setdefault("dutyChangedAt", existing.get("dutyChangedAt") or datetime.now(timezone.utc))
         else:
-            # Leaving the operational roster ends any open shift.
-            merged.pop("duty", None)
-            merged.pop("dutyChangedAt", None)
-
-        db.collection(target).document(account_id).set(merged, merge=True)
-        ref.delete()
-        return {
-            "updated": True,
-            "accountId": account_id,
-            "collection": target,
-            "movedFrom": collection,
-        }
-
-    # Non-responders have no duty field; ignore it rather than writing a
-    # meaningless one.
-    if collection == USERS:
-        data.pop("duty", None)
-        data.pop("dutyChangedAt", None)
+            # Leaving the plain-responder role ends any open shift.
+            data["duty"] = None
+            data["dutyChangedAt"] = None
 
     # The doc is guaranteed to exist (_find_account raised otherwise), but
     # set(..., merge=True) is still preferred over .update(): update() throws
@@ -442,7 +566,7 @@ def update_account(account_id: str, payload: AccountUpdate):
     # produced the "changed in Firestore but the frontend looks stale" symptom.
     ref.set(data, merge=True)
 
-    return {"updated": True, "accountId": account_id, "collection": collection, **data}
+    return {"updated": True, "accountId": account_id, "collection": RESPONDERS, **data}
 
 
 @router.patch("/{account_id}/duty")
@@ -451,13 +575,14 @@ def set_duty(account_id: str, payload: DutyUpdate):
     Shift toggle. Send {"duty": "on_duty"} / {"duty": "off_duty"} to set an
     explicit state, or an empty body to flip whatever is currently stored.
 
-    Responders only. A deactivated account cannot go on duty — that is the
-    one place where status and duty interact.
+    Plain field responders only. A deactivated account cannot go on duty —
+    that is the one place where status and duty interact.
     """
     db = get_db()
-    ref, snapshot, collection = _find_account(db, account_id)
+    ref, snapshot = _find_account(db, account_id)
+    existing_role = (snapshot.to_dict() or {}).get("role")
 
-    if collection != RESPONDERS:
+    if not _has_duty(existing_role):
         raise HTTPException(status_code=409, detail="Only responders have a duty state")
 
     existing = snapshot.to_dict() or {}
@@ -501,20 +626,20 @@ def set_status(account_id: str, payload: AccountUpdate):
         raise HTTPException(status_code=422, detail="status is required")
 
     db = get_db()
-    ref, snapshot, collection = _find_account(db, account_id)
+    ref, snapshot = _find_account(db, account_id)
+    existing = snapshot.to_dict() or {}
 
     new_status = _normalize_status(payload.status)
     status_data = {"status": new_status}
 
-    if new_status == "inactive" and collection == RESPONDERS:
-        existing = snapshot.to_dict() or {}
+    if new_status == "inactive" and _has_duty(existing.get("role")):
         if _normalize_duty(existing.get("duty")) == "on_duty":
             status_data["duty"] = "off_duty"
             status_data["dutyChangedAt"] = datetime.now(timezone.utc)
 
     ref.set(status_data, merge=True)
 
-    return {"accountId": account_id, "collection": collection, **status_data}
+    return {"accountId": account_id, "collection": RESPONDERS, **status_data}
 
 
 @router.post("/{account_id}/reset-password")
@@ -531,7 +656,7 @@ def reset_password(account_id: str):
         raise HTTPException(status_code=500, detail="firebase_admin auth is not available")
 
     db = get_db()
-    ref, _, collection = _find_account(db, account_id)
+    ref, _ = _find_account(db, account_id)
 
     try:
         firebase_auth.update_user(account_id, password=DEFAULT_RESPONDER_PASSWORD)
@@ -543,20 +668,13 @@ def reset_password(account_id: str):
 
     ref.set({"is_new": True}, merge=True)
 
-    return {"accountId": account_id, "collection": collection, "reset": True, "is_new": True}
+    return {"accountId": account_id, "collection": RESPONDERS, "reset": True, "is_new": True}
 
 
 @router.delete("/{account_id}")
 def delete_account(account_id: str):
     db = get_db()
-    ref, _, collection = _find_account(db, account_id)
+    ref, _ = _find_account(db, account_id)
     ref.delete()
 
-    # Belt and braces: clear any leftover doc in the other collection from
-    # before the split (older builds wrote to both).
-    other = USERS if collection == RESPONDERS else RESPONDERS
-    other_ref = db.collection(other).document(account_id)
-    if other_ref.get().exists:
-        other_ref.delete()
-
-    return {"deleted": True, "accountId": account_id, "collection": collection}
+    return {"deleted": True, "accountId": account_id, "collection": RESPONDERS}

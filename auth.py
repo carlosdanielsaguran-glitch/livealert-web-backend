@@ -31,6 +31,7 @@ def _raise_firestore_unavailable(exc: Exception) -> None:
     turns it into a 503 the frontend's existing try/catch blocks already
     know how to display. Always raises; never returns.
     """
+    print(f"[Firestore error] {exc.__class__.__name__}: {exc}")  # TEMP DEBUG — remove once diagnosed
     detail = "Database temporarily unavailable. Please try again in a moment."
     if isinstance(exc, GoogleAPICallError):
         detail = f"Database temporarily unavailable ({exc.__class__.__name__}). Please try again in a moment."
@@ -54,12 +55,16 @@ class SignupRequest(BaseModel):
     username: str
     email: str
     password: str | None = None  # omitted by the Accounts page -> DEFAULT_RESPONDER_PASSWORD is used
-    role: str | None = None      # explicit role for this account (e.g. "super_admin" from auth.html's
-                                  # "Create Admin Account" form). Left unset by accounts.js's officer-
-                                  # creation flow, which calls this endpoint first with no role and then
-                                  # POST /accounts right after with the real one — that second call is
-                                  # what actually places the account, so the default bootstrap below is
-                                  # still the right behavior when role is omitted.
+    role: str | None = None      # explicit role for this account. Only "super_admin"
+                                  # is accepted here (auth.html's "Create Admin Account"
+                                  # form); responder_admin is created via POST /accounts
+                                  # instead. Left unset both by mobile self-signup (falls
+                                  # through to _create_responder_for_user below, default
+                                  # plain "Responder" role) and by accounts.js's officer-
+                                  # creation flow, which calls this endpoint first with no
+                                  # role and then POST /accounts right after with the real
+                                  # one — that second call is what actually places the
+                                  # account, so the default bootstrap here is fine either way.
 
 
 class ChangePasswordRequest(BaseModel):
@@ -78,9 +83,12 @@ def _firebase_auth_request(endpoint: str, payload: dict[str, Any]) -> dict[str, 
         payload_text = exc.read().decode("utf-8", errors="ignore")
         try:
             err = json.loads(payload_text)
-            message = err.get("error", {}).get("message", payload_text)
+            message = err.get("error", {}).get("message", "Firebase Auth request failed.")
         except json.JSONDecodeError:
-            message = payload_text or "Firebase Auth request failed."
+            # Non-JSON body (e.g. an HTML error page) - log it server-side,
+            # but only send a short generic message to the client.
+            print(f"[auth._firebase_auth_request] {endpoint} returned HTTP {exc.code} with a non-JSON body")
+            message = "Firebase Auth request failed."
         raise HTTPException(status_code=400, detail=message)
     except Exception as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -88,7 +96,9 @@ def _firebase_auth_request(endpoint: str, payload: dict[str, Any]) -> dict[str, 
 
 def _find_user_by_username_or_email(value: str) -> dict[str, Any] | None:
     db = get_db()
-    users = db.collection("Users")
+    # There's only one collection now — super_admin, responder_admin, and
+    # plain responder accounts all live in Responders.
+    users = db.collection("Responders")
     matches = list(users.where("username", "==", value).limit(1).stream())
     if matches:
         return {"id": matches[0].id, **(matches[0].to_dict() or {})}
@@ -108,10 +118,13 @@ def _create_responder_for_user(user_id: str, username: str | None, email: str) -
     # use (firstName/lastName/stationId/unitId/is_new) — this used to write
     # an older shape (name/group) that predates that refactor and would
     # otherwise make self-registered accounts show up broken/unassignable
-    # in those pages.
+    # in those pages. "username" is included so _find_user_by_username_or_email
+    # (which now queries this same collection) can still resolve login-by-
+    # username, now that there's no separate Users doc to hold it.
     display_name = username or email.split("@")[0]
     first_name, _, last_name = display_name.partition(".")
     responder_data = {
+        "username": username or "",
         "firstName": first_name or display_name,
         "lastName": last_name,
         "email": email,
@@ -167,29 +180,21 @@ async def login(request: Request, payload: LoginRequest | None = Body(default=No
             user_doc = _find_user_by_username_or_email(payload.usernameOrEmail)
             username = user_doc.get("username") if user_doc else None
 
-            # Only bootstrap a Responders doc for accounts with no profile in
-            # EITHER collection yet. _create_responder_for_user() only checks
-            # Responders on its own, which is fine right after /auth/signup (it
-            # deliberately leaves a paired doc in both collections briefly — see
-            # the comment on that function) but not here: an account that
-            # already has a Users doc (e.g. a Super Admin, or any role assigned
-            # through the Accounts page) is never a Responder, and creating one
-            # for them now would outrank their real profile on every future
-            # accounts.py lookup.
-            already_has_users_profile = get_db().collection("Users").document(auth_user_id).get().exists
-            if not already_has_users_profile:
-                _create_responder_for_user(auth_user_id, username, email)
-
-            # Surface whether this account still has a default/temporary password
-            # so the frontend can force a password-change screen before letting
-            # them do anything else. Checked on the Responders doc since that's
-            # what accounts.py (the admin-facing Accounts page) actually writes
-            # is_new to; _create_responder_for_user only fills this doc in if it
-            # didn't already exist, so an admin-created account's real is_new
-            # value is never clobbered by logging in.
+            # Only one collection now, so this is a straightforward existence
+            # check: bootstrap a plain-responder doc only if this account has
+            # no profile at all yet. Any account with a role already assigned
+            # (super_admin via /auth/signup, responder_admin/responder via
+            # accounts.py) already has a doc here, so this only fires for a
+            # bare self-registration that never got a follow-up role.
             responder_snap = get_db().collection("Responders").document(auth_user_id).get()
-            if responder_snap.exists:
-                is_new = bool((responder_snap.to_dict() or {}).get("is_new", False))
+            if not responder_snap.exists:
+                _create_responder_for_user(auth_user_id, username, email)
+                responder_snap = get_db().collection("Responders").document(auth_user_id).get()
+
+            # Surface whether this account still has a default/temporary
+            # password so the frontend can force a password-change screen
+            # before letting them do anything else.
+            is_new = bool((responder_snap.to_dict() or {}).get("is_new", False))
         except Exception as exc:
             print(f"[auth.login] Firestore bookkeeping failed for {auth_user_id}, continuing with defaults: {exc}")
 
@@ -244,22 +249,33 @@ async def signup(request: Request, payload: SignupRequest | None = Body(default=
             db = get_db()
             requested_role = (payload.role or "").strip()
 
+            # responder_admin ("Admin" in the Accounts page dropdown) is
+            # created via POST /accounts, not here — this endpoint only
+            # handles the two paths that existed before that role did: a
+            # blank role (mobile self-signup -> plain responder, below) and
+            # an explicit "super_admin" (auth.html's "Create Admin Account"
+            # form).
+            if requested_role and requested_role.lower() == "responder_admin":
+                raise HTTPException(
+                    status_code=400,
+                    detail="Admin accounts are created via POST /accounts, not /auth/signup.",
+                )
+
             if requested_role:
                 # The caller already knows the final role — e.g. auth.html's
-                # "Create Admin Account" form sends role="super_admin" — so write
-                # the full account record straight into the collection that role
-                # belongs in. This replaces the old two-step dance where signup()
-                # always bootstrapped a default Responder doc and the frontend
-                # then had to PATCH /accounts/{id} afterward to relabel it; if
-                # that second call failed, the account was left sitting in
-                # Responders — unlabeled and restricted — with no visible sign
-                # anything was wrong besides a console warning.
+                # "Create Admin Account" form sends role="super_admin" — so
+                # write the full account record straight into Responders,
+                # the single collection every account now lives in. This
+                # replaces the old two-step dance where signup() always
+                # bootstrapped a default Responder doc and the frontend then
+                # had to PATCH /accounts/{id} afterward to relabel it; if
+                # that second call failed, the account was left sitting
+                # unlabeled and restricted, with no visible sign anything
+                # was wrong besides a console warning.
                 display_name = payload.username or payload.email.split("@")[0]
                 first_name, _, last_name = display_name.partition(".")
-                is_responder_role = requested_role.lower() == "responder"
-                target_collection = "Responders" if is_responder_role else "Users"
 
-                db.collection(target_collection).document(user_id).set({
+                db.collection("Responders").document(user_id).set({
                     "username": payload.username,
                     "firstName": first_name or display_name,
                     "lastName": last_name,
@@ -273,13 +289,12 @@ async def signup(request: Request, payload: SignupRequest | None = Body(default=
                     "createdAt": datetime.now(timezone.utc),
                 })
             else:
-                user_profile = {
-                    "username": payload.username,
-                    "email": payload.email,
-                    "createdAt": datetime.now(timezone.utc),
-                }
-                db.collection("Users").document(user_id).set(user_profile)
+                # No collection split anymore, so there's no need for the
+                # old "write a lightweight Users doc, then separately
+                # bootstrap a Responders doc" two-step — one write does it.
                 _create_responder_for_user(user_id, payload.username, payload.email)
+        except HTTPException:
+            raise
         except Exception as exc:
             # The Firebase Auth account already exists at this point, so
             # claiming registration failed outright would be misleading —
@@ -309,21 +324,57 @@ async def change_password(payload: ChangePasswordRequest):
     """
     Sets a new password for the currently-authenticated user, identified by
     the Firebase idToken returned from their login() call. Also clears
-    is_new on their Responders/Users docs so they aren't forced through the
+    is_new on their Responders doc so they aren't forced through the
     change-password flow again next time.
     """
-    auth_data = _firebase_auth_request("setAccountInfo", {
-        "idToken": payload.idToken,
-        "password": payload.newPassword,
-        "returnSecureToken": True,
-    })
+    if len(payload.newPassword) < 8:
+        raise HTTPException(status_code=400, detail="Password must be at least 8 characters long.")
+    if payload.newPassword == DEFAULT_RESPONDER_PASSWORD:
+        raise HTTPException(status_code=400, detail="Choose a password other than the default one.")
+
+    # Firebase only accepts a password change from a *recent* sign-in and
+    # otherwise answers CREDENTIAL_TOO_OLD_LOGIN_AGAIN. This screen is only
+    # reachable while the account is still on DEFAULT_RESPONDER_PASSWORD, so
+    # quietly sign in again with it to get a fresh idToken. If that isn't
+    # possible for any reason, fall back to the token we were given.
+    id_token = payload.idToken
+    try:
+        lookup = _firebase_auth_request("lookup", {"idToken": payload.idToken})
+        email = ((lookup.get("users") or [{}])[0]).get("email")
+        if email:
+            fresh = _firebase_auth_request("signInWithPassword", {
+                "email": email,
+                "password": DEFAULT_RESPONDER_PASSWORD,
+                "returnSecureToken": True,
+            })
+            id_token = fresh.get("idToken") or id_token
+    except HTTPException as exc:
+        print(f"[auth.change_password] Could not refresh idToken, using the original: {exc.detail}")
+
+    try:
+        auth_data = _firebase_auth_request("update", {
+            "idToken": id_token,
+            "password": payload.newPassword,
+            "returnSecureToken": True,
+        })
+    except HTTPException as exc:
+        friendly = {
+            "CREDENTIAL_TOO_OLD_LOGIN_AGAIN": "Your session is too old. Please log in again.",
+            "INVALID_ID_TOKEN": "Your session is no longer valid. Please log in again.",
+            "TOKEN_EXPIRED": "Your session has expired. Please log in again.",
+            "WEAK_PASSWORD": "That password is too weak. Try a longer one.",
+        }
+        detail = str(exc.detail)
+        for code, message in friendly.items():
+            if detail.startswith(code):
+                raise HTTPException(status_code=400, detail=message)
+        raise
 
     user_id = auth_data.get("localId")
     if user_id:
         try:
             db = get_db()
             db.collection("Responders").document(user_id).set({"is_new": False}, merge=True)
-            db.collection("Users").document(user_id).set({"is_new": False}, merge=True)
         except Exception as exc:
             # The password itself already changed in Firebase Auth by this
             # point — don't fail the whole request over is_new bookkeeping.

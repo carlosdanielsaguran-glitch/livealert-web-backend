@@ -1,9 +1,10 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from accounts import get_station_scope, route_unassigned
 from firebase import get_db
 
 try:
@@ -13,6 +14,40 @@ except ImportError:  # pragma: no cover - depends on which SDK the project uses
 
 router = APIRouter(prefix="/reports", tags=["Reports"])
 
+def _created_datetime(data: dict[str, Any]) -> datetime | None:
+    return _to_dt(data.get("timestamp") or data.get("createdAt"))
+
+
+# A report is live until it has ended or a day has passed; after that it
+# belongs in History. (report.py, dashboard.py and history.py share this rule.)
+ARCHIVE_AFTER = timedelta(hours=24)
+ENDED_STATUSES = frozenset({"resolved", "closed", "completed", "cancelled", "ended"})
+
+
+def _has_ended(data: dict[str, Any]) -> bool:
+    return str(data.get("status") or "").strip().lower() in ENDED_STATUSES
+
+
+def _is_archived(data: dict[str, Any]) -> bool:
+    if _has_ended(data):
+        return True
+    created = _created_datetime(data)
+    return created is not None and datetime.now(timezone.utc) - created >= ARCHIVE_AFTER
+
+
+def _report_station_id(data: dict[str, Any]) -> str:
+    """The station a report was routed to (same precedence the payloads use)."""
+    assigned = data.get("assignedStation") or {}
+    return str(data.get("nearestStationId") or assigned.get("stationId") or "").strip()
+
+
+def _matches_station(data: dict[str, Any], station_id: str | None) -> bool:
+    """True if the report belongs to station_id. No station_id = no filtering."""
+    if not station_id or not station_id.strip():
+        return True
+    return _report_station_id(data) == station_id.strip()
+
+
 
 class ReportUpdate(BaseModel):
     status: str | None = None
@@ -20,7 +55,7 @@ class ReportUpdate(BaseModel):
     incidentType: str | None = None
     description: str | None = None
     nearestStationId: str | None = None
-    unitId: str | None = None
+    unitIds: list[str] | None = None  # full list of assigned units (replaces existing; [] unassigns all)
 
 
 def _to_dt(firestore_ts):
@@ -123,15 +158,31 @@ def _get_unit_name(db: Any, unit_id: str | None) -> str | None:
     return None
 
 
+def _extract_unit_ids(data: dict[str, Any]) -> list[str]:
+    """All units assigned to a report, de-duplicated, order preserved.
+    Reads assignedStation.unitIds, falling back to the older single
+    assignedStation.unitId / top-level unitId for docs written before
+    multi-unit assignment existed."""
+    assigned = data.get("assignedStation") or {}
+    raw = assigned.get("unitIds")
+    if not isinstance(raw, list):
+        raw = [assigned.get("unitId") or data.get("unitId")]
+    unit_ids: list[str] = []
+    for uid in raw:
+        if uid and uid not in unit_ids:
+            unit_ids.append(uid)
+    return unit_ids
+
+
 def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any) -> dict[str, Any]:
     created_dt = _to_dt(data.get("timestamp") or data.get("createdAt"))
     location = data.get("location") if isinstance(data.get("location"), dict) else {}
     location_str = _location_to_string(data.get("location"))
 
     assigned_station = data.get("assignedStation") or {}
-    # unitId/unitName live inside assignedStation now. Fall back to the old
-    # top-level "unitId" field for docs written before this change.
-    unit_id = assigned_station.get("unitId") or data.get("unitId")
+    # Units live inside assignedStation.unitIds (the source of truth).
+    unit_ids = _extract_unit_ids(data)
+    units = [{"id": uid, "unitName": _get_unit_name(db, uid)} for uid in unit_ids]
     incident_type = (
         data.get("incidentType")
         or data.get("channelName")
@@ -139,6 +190,7 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any) -> dict[st
     )
     description = (
         data.get("description")
+        or data.get("ai_summary")
         or data.get("ai_assessment")
         or f"{incident_type} reported at {location_str}."
     )
@@ -155,30 +207,37 @@ def _build_report_payload(doc_id: str, data: dict[str, Any], db: Any) -> dict[st
         "lng": data.get("lng") or location.get("longitude") or location.get("lng"),
         "date": _history_label(created_dt),
         "status": data.get("status", "pending"),
+        "aiSummary": data.get("ai_summary"),
+        "aiReasoning": data.get("ai_reasoning"),
         "nearestStationId": data.get("nearestStationId") or assigned_station.get("stationId", ""),
         # Alias of nearestStationId under the name the frontend's unit-assignment
         # dropdown (report.js) actually reads, so a report can be filtered down
         # to the units that belong to its own station.
         "stationId": data.get("nearestStationId") or assigned_station.get("stationId", ""),
-        # Kept flat too for any older frontend code paths reading report.unitId
-        # directly; the nested assignedStation.unitId below is the source of truth.
-        "unitId": unit_id,
-        "unitName": _get_unit_name(db, unit_id),
+        "unitIds": unit_ids,
+        "units": units,
         "assignedStation": {
-            **assigned_station,
-            "unitId": unit_id,
-            "unitName": _get_unit_name(db, unit_id),
+            **{k: v for k, v in assigned_station.items() if k != "unitId"},
+            "unitIds": unit_ids,
         },
         "streamChannelId": data.get("streamChannelId") or data.get("channelName", ""),
+        # Set once, server-side, the moment a PATCH moves status into
+        # ENDED_STATUSES (see update_report below) — not client-writable.
+        "endedAt": _to_dt(data.get("endedAt")).isoformat() if _to_dt(data.get("endedAt")) else None,
     }
 
 
 @router.get("/recent")
-def get_recent_reports():
-    """Frontend dashboard page: recent incidents list. Returns ALL reports,
-    most recent first."""
+def get_recent_reports(station_id: str | None = Depends(get_station_scope)):
+    """Frontend dashboard page: recent incidents list. Returns the reports that
+    are still live, most recent first. Anything that has ended or is a day old
+    (see _is_archived) is left out here and shows up in /history."""
     db = get_db()
-    docs = list(db.collection("ActiveCalls").stream())
+    docs = [
+        doc for doc in route_unassigned(db, list(db.collection("ActiveCalls").stream()))
+        if not _is_archived(doc.to_dict() or {})
+        and _matches_station(doc.to_dict() or {}, station_id)
+    ]
 
     # Sort by the actual timestamp rather than the formatted "time" string
     # (the old version sorted strings like "5m ago" vs "2h ago" vs "Jul 19",
@@ -195,11 +254,13 @@ def get_recent_reports():
 
 
 @router.get("/{report_id}")
-def get_report_detail(report_id: str):
+def get_report_detail(report_id: str, station_id: str | None = Depends(get_station_scope)):
     """Frontend report detail page."""
     db = get_db()
     doc = db.collection("ActiveCalls").document(report_id).get()
-    if not doc.exists:
+    if doc.exists:
+        doc = route_unassigned(db, [doc])[0]
+    if not doc.exists or not _matches_station(doc.to_dict() or {}, station_id):
         raise HTTPException(status_code=404, detail="Report not found")
     return _build_report_payload(doc.id, doc.to_dict() or {}, db)
 
@@ -215,41 +276,59 @@ def update_report(report_id: str, payload: ReportUpdate):
     data = payload.model_dump(exclude_unset=True)
     existing_data = doc.to_dict() or {}
 
-    # Assigning a report to a unit — validate the unit actually exists and
-    # belongs to the same station this report is assigned to. Without this,
-    # a stale/typo'd unitId would silently attach and the frontend dropdown
-    # would just show it as unassigned again on next load (since it filters
-    # units by stationId and would never find a match). Unassigning (unitId
-    # explicitly set to null) skips this check entirely.
-    if "unitId" in data:
-        unit_id = data.pop("unitId")
+    # Stamp when a report actually ended, server-side, the first time status
+    # crosses into ENDED_STATUSES (e.g. via the "End Dispatch" button) — never
+    # trust a client-supplied endedAt. If a previously-ended report is
+    # reopened, clear the stale endedAt so it doesn't claim to be ended while
+    # status says otherwise.
+    if "status" in data:
+        new_status_ended = str(data["status"]).strip().lower() in ENDED_STATUSES
+        was_ended = _has_ended(existing_data)
+        if new_status_ended and not was_ended:
+            data["endedAt"] = datetime.now(timezone.utc)
+        elif not new_status_ended and was_ended and existing_data.get("endedAt") is not None:
+            data["endedAt"] = firestore.DELETE_FIELD
 
-        if unit_id:
-            unit_doc = db.collection("Units").document(unit_id).get()
+    # Assigning units — validate every unit exists and belongs to the same
+    # station this report is assigned to. Without this, a stale/typo'd unitId
+    # would silently attach and the frontend modal (which filters units by
+    # stationId) would never show it. Sending an empty list unassigns all units.
+    if "unitIds" in data:
+        requested = data.pop("unitIds") or []
+
+        unit_ids: list[str] = []
+        for uid in requested:
+            if uid and uid not in unit_ids:
+                unit_ids.append(uid)
+
+        existing_assigned = existing_data.get("assignedStation") or {}
+        report_station_id = (
+            data.get("nearestStationId")
+            or existing_data.get("nearestStationId")
+            or existing_assigned.get("stationId")
+        )
+
+        for uid in unit_ids:
+            unit_doc = db.collection("Units").document(uid).get()
             if not unit_doc.exists:
-                raise HTTPException(status_code=404, detail=f"Unit '{unit_id}' not found")
+                raise HTTPException(status_code=404, detail=f"Unit '{uid}' not found")
 
             unit_data = unit_doc.to_dict() or {}
-            report_station_id = data.get("nearestStationId") or existing_data.get("nearestStationId")
-
             if report_station_id and unit_data.get("stationId") != report_station_id:
                 raise HTTPException(
                     status_code=400,
-                    detail=f"Unit '{unit_id}' belongs to a different station than this report is assigned to.",
+                    detail=f"Unit '{uid}' belongs to a different station than this report is assigned to.",
                 )
 
-        # unitId lives inside the assignedStation map, not as a top-level
-        # field. Read-merge-write against the live doc (rather than trusting
-        # a client-supplied assignedStation object) so we never clobber
-        # sibling fields like stationName/commanderName/dispatchStatus with
-        # a stale copy.
-        assigned_station = dict(existing_data.get("assignedStation") or {})
-        assigned_station["unitId"] = unit_id
+        # Read-merge-write against the live doc (rather than trusting a
+        # client-supplied assignedStation object) so we never clobber sibling
+        # fields like stationName/commanderName/dispatchStatus.
+        assigned_station = dict(existing_assigned)
+        assigned_station["unitIds"] = unit_ids
+        assigned_station.pop("unitId", None)  # drop the legacy single-unit field
         data["assignedStation"] = assigned_station
 
-        # Clean up the legacy top-level "unitId" field left over from before
-        # this field moved into assignedStation, so old docs stop showing it
-        # in both places once they're touched again.
+        # Clean up the legacy top-level "unitId" field from older docs.
         if "unitId" in existing_data:
             data["unitId"] = firestore.DELETE_FIELD
 

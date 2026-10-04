@@ -39,5 +39,20 @@ if not AGORA_APP_ID or not AGORA_APP_CERTIFICATE:
     )
 
 # Firebase REST base URLs (useful if calling Firebase Auth REST API)
-FIREBASE_AUTH_URL     = f"https://identitytoolkit.googleapis.com/v1/accounts"
-FIREBASE_DB_URL       = f"https://firestore.googleapis.com/v1/projects/{PROJECT_ID}/databases/(default)/documents"
+# NOTE: these are read directly from .env as plain strings — .env does not
+# support Python f-string interpolation, so FIREBASE_DB_URL already has the
+# project ID baked into it in .env rather than using {PROJECT_ID} here.
+FIREBASE_AUTH_URL = os.getenv("FIREBASE_AUTH_URL")
+FIREBASE_DB_URL   = os.getenv("FIREBASE_DB_URL")
+
+# Web SDK config (public-facing) — reassembled from flat .env vars, since
+# .env can't hold a multi-line dict directly.
+FIREBASE_CONFIG = {
+    "apiKey": os.getenv("FIREBASE_API_KEY"),
+    "authDomain": os.getenv("FIREBASE_AUTH_DOMAIN"),
+    "projectId": os.getenv("FIREBASE_PROJECT_ID"),
+    "storageBucket": os.getenv("FIREBASE_STORAGE_BUCKET"),
+    "messagingSenderId": os.getenv("FIREBASE_MESSAGING_SENDER_ID"),
+    "appId": os.getenv("FIREBASE_APP_ID"),
+    "measurementId": os.getenv("FIREBASE_MEASUREMENT_ID"),
+}

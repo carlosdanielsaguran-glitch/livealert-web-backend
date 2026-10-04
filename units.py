@@ -9,12 +9,14 @@ router = APIRouter(prefix="/units", tags=["Units"])
 class UnitCreate(BaseModel):
     stationId: str
     unitName: str
+    jurisdiction: str = "General Area"
     status: str = "on"
 
 
 class UnitUpdate(BaseModel):
     stationId: str | None = None
     unitName: str | None = None
+    jurisdiction: str | None = None
     status: str | None = None
 
 
@@ -24,6 +26,7 @@ def _serialize_unit(doc) -> dict:
         "id": doc.id,
         "stationId": data.get("stationId", ""),
         "unitName": data.get("unitName", ""),
+        "jurisdiction": data.get("jurisdiction", "General Area"),
         "status": data.get("status", "on"),
     }
 
@@ -51,6 +54,7 @@ def create_unit(payload: UnitCreate):
     unit_data = {
         "stationId": payload.stationId,
         "unitName": payload.unitName,
+        "jurisdiction": payload.jurisdiction,
         "status": payload.status,
     }
     update_time, doc_ref = db.collection("Units").add(unit_data)

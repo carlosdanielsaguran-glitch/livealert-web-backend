@@ -17,10 +17,11 @@ import time
 from datetime import datetime, timezone
 from math import radians, sin, cos, sqrt, atan2
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from agora_token_builder import RtcTokenBuilder
 
+from accounts import get_station_scope, route_unassigned
 from config import AGORA_APP_ID, AGORA_APP_CERTIFICATE
 from firebase import get_db
 from gemini import generate_incident_summary
@@ -315,7 +316,7 @@ def view_stream(channel_id: str):
 # ── Report Summary ────────────────────────────────────────────────────────────
 
 @router.get("/{emergency_id}/summary")
-def get_report_summary(emergency_id: str):
+def get_report_summary(emergency_id: str, station_id: str | None = Depends(get_station_scope)):
     """
     Full Report Summary for 'View Report' page:
       - AI-generated description + severity level (via Gemini)
@@ -331,7 +332,14 @@ def get_report_summary(emergency_id: str):
     if not doc.exists:
         raise HTTPException(status_code=404, detail="Active call not found")
 
+    doc = route_unassigned(db, [doc])[0]
     data = doc.to_dict()
+
+    # Station admins may only open reports routed to their own station.
+    if station_id:
+        assigned = data.get("assignedStation") or {}
+        if str(data.get("nearestStationId") or assigned.get("stationId") or "").strip() != station_id:
+            raise HTTPException(status_code=404, detail="Active call not found")
 
     # IMPORTANT: live.py's /get-token endpoint (the one the reporter's phone
     # actually calls to start broadcasting) creates the ActiveCalls document
@@ -403,7 +411,7 @@ def get_report_summary(emergency_id: str):
 
     for s in station_docs:
         sd = s.to_dict()
-        loc = sd.get("location")
+        loc = sd.get("Location") if sd.get("Location") is not None else sd.get("location")
         s_lat, s_lng = None, None
         if loc:
             if hasattr(loc, "latitude"):
@@ -419,7 +427,7 @@ def get_report_summary(emergency_id: str):
         stations.append({
             "id": s.id,
             "stationName": sd.get("stationName", "Unknown"),
-            "chiefName": sd.get("chiefName", ""),
+            "chiefName": sd.get("commanderName") or sd.get("chiefName", ""),
             "lat": s_lat,
             "lng": s_lng,
             "distanceKm": distance_km,
@@ -438,6 +446,17 @@ def get_report_summary(emergency_id: str):
     normalized_level = _normalize_level(data.get("level") or ai["level"])
 
     analyzed_at = _to_dt(data.get("analyzed_at") or data.get("analyzedAt"))
+    unit_ids = data.get("unitIds")
+    if not isinstance(unit_ids, list):
+      unit_ids = assigned_station.get("unitIds")
+    if not isinstance(unit_ids, list):
+      unit_ids = [assigned_station.get("unitId") or data.get("unitId")]
+    unit_ids = list(dict.fromkeys(unit_id for unit_id in unit_ids if unit_id))
+    unit_id = assigned_station.get("unitId") or data.get("unitId") or (unit_ids[0] if unit_ids else None)
+    assigned_station = {
+      **{key: value for key, value in assigned_station.items() if key != "unitIds"},
+      "unitId": unit_id,
+    }
 
     return {
         "emergencyId": emergency_id,
@@ -470,8 +489,8 @@ def get_report_summary(emergency_id: str):
         # dashboard, since this endpoint — not report.py's /reports/recent —
         # is what ultimately populates the incident tracker modal.
         "stationId": current_nearest,
-        "unitId": data.get("unitId") or None,
-        "unitName": _get_unit_name(db, data.get("unitId")),
+        "unitId": unit_id,
+        "unitName": _get_unit_name(db, unit_id),
         "streamChannelId": channel_id,
         "viewUrl": f"/api/v1/stream/view/{channel_id}" if channel_id else None,
         "joinUrl": f"/api/v1/stream/join/{channel_id}" if channel_id else None,

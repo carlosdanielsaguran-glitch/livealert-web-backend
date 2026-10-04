@@ -5,21 +5,18 @@ Generates incident descriptions and severity levels
 using Google Gemini API.
 
 Install:
-    pip install google-generativeai
+    pip install google-genai
 """
 import os
-import google.generativeai as genai
+from google import genai
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-
-
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-
-model = genai.GenerativeModel("gemini-1.5-flash")
+MODEL_NAME = "gemini-2.0-flash"
 
 
 def generate_incident_summary(incident_type: str, location: str = "") -> dict:
@@ -42,7 +39,10 @@ LEVEL: <1, 2, or 3>
 """
 
     try:
-        response = model.generate_content(prompt)
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=prompt,
+        )
         text = response.text.strip()
 
         description = ""
